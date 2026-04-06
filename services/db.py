@@ -5,7 +5,7 @@ from supabase import AsyncClient, acreate_client
 
 logger = logging.getLogger(__name__)
 
-_client: AsyncClient | None = None
+_client: "AsyncClient | None" = None
 
 
 async def get_client() -> AsyncClient:
