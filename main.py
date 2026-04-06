@@ -1,3 +1,6 @@
+from dotenv import load_dotenv
+load_dotenv()
+
 from fastapi import FastAPI
 from contextlib import asynccontextmanager
 from routers import webhook, user
