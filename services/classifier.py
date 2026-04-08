@@ -95,7 +95,7 @@ async def claude_classify(note: str, amount: float) -> str:
                     "messages": [{"role": "user", "content": prompt}],
                 },
             )
-            category = resp.json()["content"][0]["text"].strip()
+            category = resp.json()["content"][0]["text"].strip().strip("`").strip()
             if category in CATEGORIES:
                 return category
             return "其他"
