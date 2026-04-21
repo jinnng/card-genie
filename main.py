@@ -11,12 +11,9 @@ from services.scheduler import create_scheduler
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
-
     scheduler = create_scheduler()
     scheduler.start()
-
     yield
-
     scheduler.shutdown()
 
 
@@ -37,9 +34,15 @@ async def health():
 
 @app.post("/admin/send-weekly-report")
 async def trigger_weekly_report():
-    """
-    手動觸發週報推播（測試用，正式上線前可移除）
-    """
+    """手動觸發週報推播（測試用）"""
     from services.scheduler import send_weekly_reports
     await send_weekly_reports()
     return {"status": "ok", "message": "週報推播完成"}
+
+
+@app.post("/admin/run-scraper")
+async def trigger_scraper():
+    """手動觸發爬蟲（測試用）"""
+    from services.scraper import run_all_scrapers
+    await run_all_scrapers()
+    return {"status": "ok", "message": "爬蟲執行完成"}

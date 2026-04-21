@@ -9,7 +9,9 @@ from services.card_service import (
     add_user_card,
     get_banks,
     get_best_card,
+    get_relevant_promotion,
     get_user_cards,
+    get_user_promotions,
     get_user_state,
     remove_user_card,
     search_cards,
@@ -42,6 +44,7 @@ HELP_TEXT = """卡管家使用說明
 
 📊 查詢
   本週 → 本週消費摘要
+  我的優惠 → 查看持卡優惠活動
 
 💳 信用卡
   我的卡片 → 查看 / 設定持有的卡
@@ -120,14 +123,12 @@ async def handle_event(event: dict) -> None:
 
 
 async def handle_text_message(reply_token: str, user_id: str, text: str) -> None:
-    # 取得用戶狀態，判斷是否在持卡設定流程中
     state = await get_user_state(user_id)
 
     if state == "setting_cards":
         await handle_card_setting(reply_token, user_id, text)
         return
 
-    # 一般指令
     if text in ("說明", "help"):
         await reply_message(reply_token, HELP_TEXT)
         return
@@ -138,6 +139,10 @@ async def handle_text_message(reply_token: str, user_id: str, text: str) -> None
 
     if text in ("我的卡片", "卡片設定", "信用卡"):
         await handle_show_cards(reply_token, user_id)
+        return
+
+    if text in ("我的優惠", "優惠", "最新優惠"):
+        await handle_my_promotions(reply_token, user_id)
         return
 
     # 記帳解析
@@ -159,7 +164,7 @@ async def handle_text_message(reply_token: str, user_id: str, text: str) -> None
         note=result["note"],
     )
 
-    # 組合回覆：確認訊息 + 用卡建議
+    # 組合回覆：確認訊息 + 用卡建議 + 相關優惠
     emoji = CATEGORY_EMOJI.get(result["category"], "📝")
     amount_str = f"NT${result['amount']:,.0f}"
     reply = f"✅ {result['category']} {amount_str}，已記錄 {emoji}"
@@ -168,7 +173,45 @@ async def handle_text_message(reply_token: str, user_id: str, text: str) -> None
     if best_card:
         reply += f"\n\n💳 提醒：{best_card['bank']} {best_card['name']} 本類別回饋 {best_card['rate']}%，記得用"
 
+        # 查詢該卡是否有相關限時優惠
+        promo = await get_relevant_promotion(db_user_id, result["category"], best_card["name"])
+        if promo:
+            valid_str = f"，活動至 {promo['valid_until']}" if promo.get("valid_until") else ""
+            reply += f"\n🎁 限時優惠：{promo['title']}{valid_str}"
+
     await reply_message(reply_token, reply)
+
+
+async def handle_my_promotions(reply_token: str, user_id: str) -> None:
+    """查詢用戶所有持卡的有效優惠"""
+    db_user_id = await get_or_create_user(user_id)
+    cards_with_promos = await get_user_promotions(db_user_id)
+
+    if not cards_with_promos:
+        cards = await get_user_cards(db_user_id)
+        if not cards:
+            await reply_message(
+                reply_token,
+                "你還沒有設定持有的信用卡。\n輸入「我的卡片」開始設定。"
+            )
+        else:
+            await reply_message(
+                reply_token,
+                "目前你的卡片沒有進行中的限時優惠。\n每月初會自動更新最新優惠資訊。"
+            )
+        return
+
+    lines = ["🎁 你的卡片限時優惠\n"]
+    for card_data in cards_with_promos:
+        lines.append(f"💳 {card_data['bank']} {card_data['card_name']}")
+        for promo in card_data["promotions"]:
+            valid_str = f"（至 {promo['valid_until']}）" if promo.get("valid_until") else ""
+            lines.append(f"  • {promo['title']}{valid_str}")
+            if promo.get("detail"):
+                lines.append(f"    {promo['detail']}")
+        lines.append("")
+
+    await reply_message(reply_token, "\n".join(lines).strip())
 
 
 async def handle_show_cards(reply_token: str, user_id: str) -> None:
@@ -190,7 +233,6 @@ async def handle_show_cards(reply_token: str, user_id: str) -> None:
 async def handle_card_setting(reply_token: str, user_id: str, text: str) -> None:
     """持卡設定流程：銀行選單 → 卡片選單 → 新增 / 刪除"""
 
-    # 結束設定
     if text in ("完成", "結束", "done"):
         await set_user_state(user_id, None)
         db_user_id = await get_or_create_user(user_id)
@@ -208,7 +250,6 @@ async def handle_card_setting(reply_token: str, user_id: str, text: str) -> None
     db_user_id = await get_or_create_user(user_id)
     banks = await get_banks()
 
-    # 刪除卡片（輸入「－卡片名稱」）
     if text.startswith("－") or text.startswith("-"):
         query = text.lstrip("－").lstrip("-").strip()
         results = await search_cards(query)
@@ -228,12 +269,10 @@ async def handle_card_setting(reply_token: str, user_id: str, text: str) -> None
         )
         return
 
-    # 換銀行
     if text == "換銀行":
         await reply_with_quick_reply(reply_token, "請選擇發卡銀行：", banks + ["完成"])
         return
 
-    # 用戶選了銀行名稱 → 列出該銀行卡片
     if text in banks:
         results = await search_cards(text)
         card_names = [c["name"] for c in results]
@@ -244,7 +283,6 @@ async def handle_card_setting(reply_token: str, user_id: str, text: str) -> None
         )
         return
 
-    # 用戶選了卡片名稱 → 新增
     results = await search_cards(text)
     if not results:
         await reply_with_quick_reply(
