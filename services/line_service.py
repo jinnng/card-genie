@@ -17,12 +17,13 @@ from services.card_service import (
     search_cards,
     set_user_state,
 )
-from services.classifier import parse_expense
 from services.transaction_service import get_or_create_user, save_transaction
 
 logger = logging.getLogger(__name__)
 
 LINE_REPLY_URL = "https://api.line.me/v2/bot/message/reply"
+
+CATEGORIES = ["飲食", "超市", "交通", "網購", "娛樂", "醫療", "服飾", "其他"]
 
 CATEGORY_EMOJI = {
     "飲食": "🍱",
@@ -35,21 +36,17 @@ CATEGORY_EMOJI = {
     "其他": "📝",
 }
 
-HELP_TEXT = """卡管家使用說明
+HELP_TEXT = """Card Genie 使用說明
 
-📝 記帳
-  早餐 85
-  家樂福 2340
-  GU 790
+請使用底部選單操作：
 
-📊 查詢
-  本週 → 本週消費摘要
-  我的優惠 → 查看持卡優惠活動
+✏️  記帳 → 選擇類別並輸入金額
+📊 本週摘要 → 查看本週消費
+💳 卡片設定 → 管理持有的信用卡
+📈 消費分析 → 分析消費輪廓（即將推出）
 
-💳 信用卡
-  我的卡片 → 查看 / 設定持有的卡
-
-❓ 其他
+其他指令：
+  我的優惠 → 查看持卡限時優惠
   說明 → 顯示此說明"""
 
 
@@ -109,7 +106,7 @@ async def handle_event(event: dict) -> None:
     if event_type == "follow":
         await reply_message(
             event["replyToken"],
-            "👋 歡迎使用卡管家！\n\n直接傳送消費就能記帳：\n「早餐 85」\n「家樂福 2340」\n\n輸入「說明」查看所有功能。",
+            "👋 歡迎使用 Card Genie！\n\n請使用底部選單開始記帳，或輸入「說明」查看所有功能。",
         )
 
     elif event_type == "message":
@@ -125,56 +122,109 @@ async def handle_event(event: dict) -> None:
 async def handle_text_message(reply_token: str, user_id: str, text: str) -> None:
     state = await get_user_state(user_id)
 
+    # 持卡設定流程
     if state == "setting_cards":
         await handle_card_setting(reply_token, user_id, text)
         return
 
-    if text in ("說明", "help"):
-        await reply_message(reply_token, HELP_TEXT)
+    # 等待輸入金額
+    if state and state.startswith("awaiting_amount:"):
+        category = state.split(":", 1)[1]
+        await handle_amount_input(reply_token, user_id, text, category)
         return
 
-    if text in ("本週", "本周", "這週", "這周"):
+    # Rich Menu 按鈕對應
+    if text == "記帳":
+        await handle_start_accounting(reply_token, user_id)
+        return
+
+    if text in ("本週摘要", "本週", "本周", "這週", "這周"):
         await handle_weekly_summary(reply_token, user_id)
         return
 
-    if text in ("我的卡片", "卡片設定", "信用卡"):
+    if text in ("卡片設定", "我的卡片", "信用卡"):
         await handle_show_cards(reply_token, user_id)
+        return
+
+    if text == "消費分析":
+        await reply_message(
+            reply_token,
+            "📈 消費分析功能即將推出！\n\n將根據你的消費輪廓推薦最適合的卡片組合，敬請期待。"
+        )
         return
 
     if text in ("我的優惠", "優惠", "最新優惠"):
         await handle_my_promotions(reply_token, user_id)
         return
 
-    # 記帳解析
-    result = await parse_expense(text)
+    if text in ("說明", "help"):
+        await reply_message(reply_token, HELP_TEXT)
+        return
 
-    if not result:
-        await reply_message(
-            reply_token,
-            "請用「品項 金額」的格式記帳\n例如：早餐 85、家樂福 2340\n\n輸入「說明」查看所有功能",
-        )
+    # 類別選擇（記帳流程中）
+    clean_text = text.split(" ")[-1] if " " in text else text
+    if state == "awaiting_category" and clean_text in CATEGORIES:
+        text = clean_text  # 統一用純文字處理
+        await set_user_state(user_id, f"awaiting_amount:{text}")
+        emoji = CATEGORY_EMOJI.get(text, "📝")
+        await reply_message(reply_token, f"{emoji} {text}\n\n請輸入金額：")
+        return
+
+    # 無法識別的輸入
+    await reply_message(
+        reply_token,
+        "請使用底部選單操作，或輸入「說明」查看功能列表。"
+    )
+
+
+async def handle_start_accounting(reply_token: str, user_id: str) -> None:
+    """開始記帳：顯示類別選單"""
+    await set_user_state(user_id, "awaiting_category")
+    category_options = [f"{CATEGORY_EMOJI[c]} {c}" for c in CATEGORIES]
+    await reply_with_quick_reply(
+        reply_token,
+        "請選擇消費類別：",
+        category_options + ["取消"]
+    )
+
+
+async def handle_amount_input(reply_token: str, user_id: str, text: str, category: str) -> None:
+    """處理金額輸入"""
+
+    if text == "取消":
+        await set_user_state(user_id, None)
+        await reply_message(reply_token, "已取消記帳。")
+        return
+
+    # 解析金額
+    try:
+        amount = float(text.replace(",", "").replace("，", ""))
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        await reply_message(reply_token, "請輸入有效的金額數字，例如：85 或 2340")
         return
 
     # 寫入資料庫
+    await set_user_state(user_id, None)
     db_user_id = await get_or_create_user(user_id)
     await save_transaction(
         user_id=db_user_id,
-        amount=result["amount"],
-        category=result["category"],
-        note=result["note"],
+        amount=amount,
+        category=category,
+        note=f"{category} {amount:.0f}",
     )
 
-    # 組合回覆：確認訊息 + 用卡建議 + 相關優惠
-    emoji = CATEGORY_EMOJI.get(result["category"], "📝")
-    amount_str = f"NT${result['amount']:,.0f}"
-    reply = f"✅ {result['category']} {amount_str}，已記錄 {emoji}"
+    # 組合回覆：確認 + 用卡建議 + 相關優惠
+    emoji = CATEGORY_EMOJI.get(category, "📝")
+    amount_str = f"NT${amount:,.0f}"
+    reply = f"✅ {category} {amount_str}，已記錄 {emoji}"
 
-    best_card = await get_best_card(db_user_id, result["category"])
+    best_card = await get_best_card(db_user_id, category)
     if best_card:
         reply += f"\n\n💳 提醒：{best_card['bank']} {best_card['name']} 本類別回饋 {best_card['rate']}%，記得用"
 
-        # 查詢該卡是否有相關限時優惠
-        promo = await get_relevant_promotion(db_user_id, result["category"], best_card["name"])
+        promo = await get_relevant_promotion(db_user_id, category, best_card["name"])
         if promo:
             valid_str = f"，活動至 {promo['valid_until']}" if promo.get("valid_until") else ""
             reply += f"\n🎁 限時優惠：{promo['title']}{valid_str}"
@@ -192,7 +242,7 @@ async def handle_my_promotions(reply_token: str, user_id: str) -> None:
         if not cards:
             await reply_message(
                 reply_token,
-                "你還沒有設定持有的信用卡。\n輸入「我的卡片」開始設定。"
+                "你還沒有設定持有的信用卡。\n請使用底部選單「卡片設定」開始設定。"
             )
         else:
             await reply_message(
@@ -317,7 +367,7 @@ async def handle_weekly_summary(reply_token: str, user_id: str) -> None:
     summary = await get_weekly_summary(db_user_id)
 
     if not summary:
-        await reply_message(reply_token, "本週還沒有消費記錄，快來記第一筆吧！")
+        await reply_message(reply_token, "本週還沒有消費記錄，點底部選單「記帳」開始記錄吧！")
         return
 
     total = sum(summary.values())
