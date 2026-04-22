@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 
@@ -8,8 +9,6 @@ import httpx
 from services.card_service import (
     add_user_card,
     get_banks,
-    get_best_card,
-    get_relevant_promotion,
     get_user_cards,
     get_user_promotions,
     get_user_state,
@@ -17,13 +16,12 @@ from services.card_service import (
     search_cards,
     set_user_state,
 )
+from services.classifier import parse_expense
 from services.transaction_service import get_or_create_user, save_transaction
 
 logger = logging.getLogger(__name__)
 
 LINE_REPLY_URL = "https://api.line.me/v2/bot/message/reply"
-
-CATEGORIES = ["飲食", "超市", "交通", "網購", "娛樂", "醫療", "服飾", "其他"]
 
 CATEGORY_EMOJI = {
     "飲食": "🍱",
@@ -40,7 +38,7 @@ HELP_TEXT = """Card Genie 使用說明
 
 請使用底部選單操作：
 
-✏️  記帳 → 選擇類別並輸入金額
+✏️  記帳 → 輸入消費內容
 📊 本週摘要 → 查看本週消費
 💳 卡片設定 → 管理持有的信用卡
 📈 消費分析 → 分析消費輪廓（即將推出）
@@ -48,6 +46,12 @@ HELP_TEXT = """Card Genie 使用說明
 其他指令：
   我的優惠 → 查看持卡限時優惠
   說明 → 顯示此說明"""
+
+ACCOUNTING_GUIDE = """請輸入消費內容，例如：
+
+• 家樂福 2340
+• 麥當勞85
+• Uber 150"""
 
 
 async def reply_message(reply_token: str, text: str) -> None:
@@ -68,7 +72,7 @@ async def reply_message(reply_token: str, text: str) -> None:
 
 
 async def reply_with_quick_reply(reply_token: str, text: str, options: list[str]) -> None:
-    """回覆訊息並附上 Quick Reply 按鈕（LINE 最多 13 個）"""
+    """回覆訊息並附上 Quick Reply 按鈕"""
     token = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
     headers = {
         "Content-Type": "application/json",
@@ -100,6 +104,147 @@ async def reply_with_quick_reply(reply_token: str, text: str, options: list[str]
             logger.error(f"LINE reply failed: {resp.status_code} {resp.text}")
 
 
+async def reply_payment_flex(
+    reply_token: str,
+    category: str,
+    amount: float,
+    note: str,
+    user_cards: list[dict],
+) -> None:
+    """回覆 Flex Message 付款方式選擇"""
+    token = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}",
+    }
+
+    emoji = CATEGORY_EMOJI.get(category, "📝")
+    amount_str = f"NT${amount:,.0f}"
+
+    # 建立付款方式按鈕
+    payment_buttons = []
+
+    # 現金
+    payment_buttons.append({
+        "type": "button",
+        "action": {
+            "type": "message",
+            "label": "💵 現金",
+            "text": f"付款:現金",
+        },
+        "style": "secondary",
+        "height": "sm",
+    })
+
+    # 簽帳金融卡
+    payment_buttons.append({
+        "type": "button",
+        "action": {
+            "type": "message",
+            "label": "🏧 簽帳金融卡",
+            "text": f"付款:簽帳金融卡",
+        },
+        "style": "secondary",
+        "height": "sm",
+    })
+
+    # 用戶持有的信用卡
+    for card in user_cards[:8]:  # 最多 8 張避免過長
+        card_label = f"{card['bank']} {card['name']}"
+        payment_buttons.append({
+            "type": "button",
+            "action": {
+                "type": "message",
+                "label": card_label[:20],
+                "text": f"付款:{card_label}",
+            },
+            "style": "primary",
+            "height": "sm",
+        })
+
+    # 取消按鈕
+    payment_buttons.append({
+        "type": "button",
+        "action": {
+            "type": "message",
+            "label": "取消",
+            "text": "取消記帳",
+        },
+        "style": "secondary",
+        "height": "sm",
+        "color": "#aaaaaa",
+    })
+
+    flex_message = {
+        "type": "flex",
+        "altText": f"{emoji} {category} {amount_str} — 請選擇付款方式",
+        "contents": {
+            "type": "bubble",
+            "header": {
+                "type": "box",
+                "layout": "vertical",
+                "contents": [
+                    {
+                        "type": "text",
+                        "text": f"{emoji} {category}",
+                        "weight": "bold",
+                        "size": "lg",
+                        "color": "#ffffff",
+                    },
+                    {
+                        "type": "text",
+                        "text": amount_str,
+                        "size": "xxl",
+                        "weight": "bold",
+                        "color": "#ffffff",
+                    },
+                    {
+                        "type": "text",
+                        "text": note,
+                        "size": "sm",
+                        "color": "#ffffff99",
+                        "wrap": True,
+                    },
+                ],
+                "backgroundColor": "#3b82f6",
+                "paddingAll": "16px",
+            },
+            "body": {
+                "type": "box",
+                "layout": "vertical",
+                "contents": [
+                    {
+                        "type": "text",
+                        "text": "請選擇付款方式",
+                        "weight": "bold",
+                        "size": "sm",
+                        "color": "#666666",
+                        "margin": "none",
+                    },
+                    {
+                        "type": "box",
+                        "layout": "vertical",
+                        "contents": payment_buttons,
+                        "spacing": "sm",
+                        "margin": "md",
+                    },
+                ],
+                "paddingAll": "16px",
+            },
+        },
+    }
+
+    payload = {
+        "replyToken": reply_token,
+        "messages": [flex_message],
+    }
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(LINE_REPLY_URL, headers=headers, json=payload)
+        if resp.status_code != 200:
+            logger.error(f"LINE flex reply failed: {resp.status_code} {resp.text}")
+
+
 async def handle_event(event: dict) -> None:
     event_type = event.get("type")
 
@@ -127,15 +272,24 @@ async def handle_text_message(reply_token: str, user_id: str, text: str) -> None
         await handle_card_setting(reply_token, user_id, text)
         return
 
-    # 等待輸入金額
-    if state and state.startswith("awaiting_amount:"):
-        category = state.split(":", 1)[1]
-        await handle_amount_input(reply_token, user_id, text, category)
+    # 等待付款方式選擇
+    if state and state.startswith("awaiting_payment:"):
+        await handle_payment_selection(reply_token, user_id, text, state)
         return
 
-    # Rich Menu 按鈕對應
+    # 等待記帳輸入
+    if state == "awaiting_expense":
+        if text == "取消記帳":
+            await set_user_state(user_id, None)
+            await reply_message(reply_token, "已取消記帳。")
+            return
+        await handle_expense_input(reply_token, user_id, text)
+        return
+
+    # Rich Menu 按鈕
     if text == "記帳":
-        await handle_start_accounting(reply_token, user_id)
+        await set_user_state(user_id, "awaiting_expense")
+        await reply_message(reply_token, ACCOUNTING_GUIDE)
         return
 
     if text in ("本週摘要", "本週", "本周", "這週", "這周"):
@@ -153,7 +307,7 @@ async def handle_text_message(reply_token: str, user_id: str, text: str) -> None
         )
         return
 
-    if text in ("我的優惠", "優惠", "最新優惠"):
+    if text in ("我的優惠", "優惠"):
         await handle_my_promotions(reply_token, user_id)
         return
 
@@ -161,75 +315,127 @@ async def handle_text_message(reply_token: str, user_id: str, text: str) -> None
         await reply_message(reply_token, HELP_TEXT)
         return
 
-    # 類別選擇（記帳流程中）
-    clean_text = text.split(" ")[-1] if " " in text else text
-    if state == "awaiting_category" and clean_text in CATEGORIES:
-        text = clean_text  # 統一用純文字處理
-        await set_user_state(user_id, f"awaiting_amount:{text}")
-        emoji = CATEGORY_EMOJI.get(text, "📝")
-        await reply_message(reply_token, f"{emoji} {text}\n\n請輸入金額：")
+    if text == "取消記帳":
+        await set_user_state(user_id, None)
+        await reply_message(reply_token, "已取消記帳。")
         return
 
-    # 無法識別的輸入
+    # 非狀態下的任意輸入，嘗試解析為記帳
+    result = await parse_expense(text)
+    if result:
+        await show_payment_selection(reply_token, user_id, result)
+        return
+
     await reply_message(
         reply_token,
         "請使用底部選單操作，或輸入「說明」查看功能列表。"
     )
 
 
-async def handle_start_accounting(reply_token: str, user_id: str) -> None:
-    """開始記帳：顯示類別選單"""
-    await set_user_state(user_id, "awaiting_category")
-    category_options = [f"{CATEGORY_EMOJI[c]} {c}" for c in CATEGORIES]
-    await reply_with_quick_reply(
+async def handle_expense_input(reply_token: str, user_id: str, text: str) -> None:
+    """在 awaiting_expense 狀態下處理記帳輸入"""
+
+    # 如果用戶在記帳流程中又點了其他功能，重置狀態並處理對應指令
+    if text == "記帳":
+        await reply_message(reply_token, ACCOUNTING_GUIDE)
+        return
+
+    if text in ("本週摘要", "本週", "本周"):
+        await set_user_state(user_id, None)
+        await handle_weekly_summary(reply_token, user_id)
+        return
+
+    if text in ("卡片設定", "我的卡片"):
+        await set_user_state(user_id, None)
+        await handle_show_cards(reply_token, user_id)
+        return
+
+    if text == "消費分析":
+        await set_user_state(user_id, None)
+        await reply_message(reply_token, "📈 消費分析功能即將推出！")
+        return
+
+    if text in ("說明", "help"):
+        await set_user_state(user_id, None)
+        await reply_message(reply_token, HELP_TEXT)
+        return
+    result = await parse_expense(text)
+
+    if not result:
+        await reply_message(
+            reply_token,
+            "無法解析消費內容，請重新輸入，例如：\n家樂福 2340\n麥當勞85"
+        )
+        return
+
+    await show_payment_selection(reply_token, user_id, result)
+
+
+async def show_payment_selection(reply_token: str, user_id: str, result: dict) -> None:
+    """顯示付款方式 Flex Message，並儲存待確認的記帳資料到 state"""
+    db_user_id = await get_or_create_user(user_id)
+    user_cards = await get_user_cards(db_user_id)
+
+    # 把記帳資料暫存到 state
+    state_data = json.dumps({
+        "amount": result["amount"],
+        "category": result["category"],
+        "note": result["note"],
+    }, ensure_ascii=False)
+    await set_user_state(user_id, f"awaiting_payment:{state_data}")
+
+    await reply_payment_flex(
         reply_token,
-        "請選擇消費類別：",
-        category_options + ["取消"]
+        category=result["category"],
+        amount=result["amount"],
+        note=result["note"],
+        user_cards=user_cards,
     )
 
 
-async def handle_amount_input(reply_token: str, user_id: str, text: str, category: str) -> None:
-    """處理金額輸入"""
+async def handle_payment_selection(reply_token: str, user_id: str, text: str, state: str) -> None:
+    """處理付款方式選擇，寫入資料庫"""
 
-    if text == "取消":
+    if text == "取消記帳":
         await set_user_state(user_id, None)
         await reply_message(reply_token, "已取消記帳。")
         return
 
-    # 解析金額
-    try:
-        amount = float(text.replace(",", "").replace("，", ""))
-        if amount <= 0:
-            raise ValueError
-    except ValueError:
-        await reply_message(reply_token, "請輸入有效的金額數字，例如：85 或 2340")
+    if not text.startswith("付款:"):
+        # 非付款選擇的輸入，忽略並提示
+        await reply_message(reply_token, "請點選上方的付款方式按鈕。")
         return
 
-    # 寫入資料庫
+    payment = text.replace("付款:", "").strip()
+
+    # 解析暫存的記帳資料
+    try:
+        state_data = state.replace("awaiting_payment:", "", 1)
+        expense = json.loads(state_data)
+    except Exception:
+        await set_user_state(user_id, None)
+        await reply_message(reply_token, "記帳資料遺失，請重新記帳。")
+        return
+
+    # 清除狀態
     await set_user_state(user_id, None)
+
+    # 寫入資料庫
     db_user_id = await get_or_create_user(user_id)
     await save_transaction(
         user_id=db_user_id,
-        amount=amount,
-        category=category,
-        note=f"{category} {amount:.0f}",
+        amount=expense["amount"],
+        category=expense["category"],
+        note=expense["note"],
+        card_used=payment,
     )
 
-    # 組合回覆：確認 + 用卡建議 + 相關優惠
-    emoji = CATEGORY_EMOJI.get(category, "📝")
-    amount_str = f"NT${amount:,.0f}"
-    reply = f"✅ {category} {amount_str}，已記錄 {emoji}"
-
-    best_card = await get_best_card(db_user_id, category)
-    if best_card:
-        reply += f"\n\n💳 提醒：{best_card['bank']} {best_card['name']} 本類別回饋 {best_card['rate']}%，記得用"
-
-        promo = await get_relevant_promotion(db_user_id, category, best_card["name"])
-        if promo:
-            valid_str = f"，活動至 {promo['valid_until']}" if promo.get("valid_until") else ""
-            reply += f"\n🎁 限時優惠：{promo['title']}{valid_str}"
-
-    await reply_message(reply_token, reply)
+    emoji = CATEGORY_EMOJI.get(expense["category"], "📝")
+    amount_str = f"NT${expense['amount']:,.0f}"
+    await reply_message(
+        reply_token,
+        f"✅ {expense['category']} {amount_str}，已記錄 {emoji}\n💳 付款方式：{payment}"
+    )
 
 
 async def handle_my_promotions(reply_token: str, user_id: str) -> None:
@@ -281,8 +487,7 @@ async def handle_show_cards(reply_token: str, user_id: str) -> None:
 
 
 async def handle_card_setting(reply_token: str, user_id: str, text: str) -> None:
-    """持卡設定流程：銀行選單 → 卡片選單 → 新增 / 刪除"""
-
+    """持卡設定流程"""
     if text in ("完成", "結束", "done"):
         await set_user_state(user_id, None)
         db_user_id = await get_or_create_user(user_id)
@@ -291,7 +496,7 @@ async def handle_card_setting(reply_token: str, user_id: str, text: str) -> None
             card_list = "\n".join(f"• {c['bank']} {c['name']}" for c in cards)
             await reply_message(
                 reply_token,
-                f"✅ 設定完成！\n\n你的卡片：\n{card_list}\n\n記帳時會自動提醒最佳用卡。"
+                f"✅ 設定完成！\n\n你的卡片：\n{card_list}\n\n記帳時會自動顯示你的卡片供選擇。"
             )
         else:
             await reply_message(reply_token, "設定完成，目前沒有持卡紀錄。")
@@ -311,10 +516,11 @@ async def handle_card_setting(reply_token: str, user_id: str, text: str) -> None
             )
             return
         card = results[0]
+        from services.card_service import remove_user_card
         await remove_user_card(db_user_id, card["id"])
         await reply_with_quick_reply(
             reply_token,
-            f"✅ 已移除 {card['bank']} {card['name']}\n\n繼續選擇銀行新增，或點「完成」結束",
+            f"✅ 已移除 {card['bank']} {card['name']}",
             banks + ["完成"]
         )
         return
@@ -343,18 +549,19 @@ async def handle_card_setting(reply_token: str, user_id: str, text: str) -> None
         return
 
     card = results[0]
+    from services.card_service import add_user_card
     added = await add_user_card(db_user_id, card["id"])
 
     if added:
         await reply_with_quick_reply(
             reply_token,
-            f"✅ 已新增 {card['bank']} {card['name']}\n\n繼續選擇銀行新增其他卡片，或點「完成」結束",
+            f"✅ 已新增 {card['bank']} {card['name']}\n\n繼續選擇銀行或點「完成」結束",
             banks + ["完成"]
         )
     else:
         await reply_with_quick_reply(
             reply_token,
-            f"「{card['bank']} {card['name']}」已在你的清單中了\n\n繼續選擇銀行，或點「完成」結束",
+            f"「{card['bank']} {card['name']}」已在清單中\n\n繼續選擇銀行或點「完成」結束",
             banks + ["完成"]
         )
 

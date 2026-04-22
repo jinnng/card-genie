@@ -15,7 +15,7 @@ SUPERMARKET_KEYWORDS = ["家樂福", "全聯", "大潤發", "愛買", "costco", 
 
 FOOD_KEYWORDS = ["早餐", "午餐", "晚餐", "宵夜", "咖啡", "飲料", "便當", "麵", "飯", "滷味",
                  "麥當勞", "肯德基", "漢堡王", "摩斯", "subway", "7-11", "全家", "萊爾富",
-                 "吃", "餐", "食"]
+                 "吃", "餐", "食", "ubereats", "foodpanda"]
 
 TRANSPORT_KEYWORDS = ["uber", "計程車", "捷運", "公車", "停車", "加油", "高鐵", "台鐵", "油資", "油費"]
 
@@ -28,17 +28,16 @@ MEDICAL_KEYWORDS = ["藥局", "診所", "醫院", "掛號", "藥", "健保"]
 CLOTHING_KEYWORDS = ["衣服", "褲子", "裙子", "鞋子", "包包", "外套", "上衣", "內衣", "襪子",
                      "gu", "zara", "uniqlo", "h&m", "nike", "adidas", "服飾", "穿搭"]
 
+# 支援有空格與無空格：「家樂福 240」或「家樂福240」
+# 也支援數字在前：「240 家樂福」
 SIMPLE_PATTERN = re.compile(
-    r"^(?P<note>.+?)\s+(?P<amount>\d+(?:\.\d+)?)$|^(?P<amount2>\d+(?:\.\d+)?)\s+(?P<note2>.+)$"
+    r"^(?P<note>.+?)\s*(?P<amount>\d+(?:\.\d+)?)$"
+    r"|^(?P<amount2>\d+(?:\.\d+)?)\s*(?P<note2>.+)$"
 )
 
 
 def _regex_classify(note: str) -> str | None:
-    """
-    關鍵字比對，找不到明確類別時回傳 None，交給 Claude 判斷
-    """
     note_lower = note.lower()
-
     for kw in SUPERMARKET_KEYWORDS:
         if kw in note_lower:
             return "超市"
@@ -60,14 +59,11 @@ def _regex_classify(note: str) -> str | None:
     for kw in MEDICAL_KEYWORDS:
         if kw in note_lower:
             return "醫療"
-
     return None
 
 
 async def claude_classify(note: str, amount: float) -> str:
-    """
-    只問 Claude 類別，金額已由 Regex 取得，省 token
-    """
+    """只問 Claude 類別，金額已由 Regex 取得"""
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if not api_key:
         return "其他"
@@ -105,9 +101,7 @@ async def claude_classify(note: str, amount: float) -> str:
 
 
 async def claude_parse(text: str) -> dict | None:
-    """
-    完整解析：金額和類別都交給 Claude（用於完全無法用 Regex 解析的輸入）
-    """
+    """完整解析：金額和類別都交給 Claude"""
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if not api_key:
         return None
@@ -161,29 +155,32 @@ async def claude_parse(text: str) -> dict | None:
 async def parse_expense(text: str) -> dict | None:
     """
     主入口，三層處理：
-    1. Regex 取得金額 + 關鍵字命中類別 → 直接回傳，不呼叫 API
-    2. Regex 取得金額，但類別不確定 → 只問 Claude 類別（省 token）
-    3. Regex 完全無法解析 → 整串交給 Claude 完整判斷
+    1. Regex 取得金額 + 關鍵字命中類別 → 直接回傳
+    2. Regex 取得金額，但類別不確定 → 只問 Claude 類別
+    3. Regex 完全無法解析 → 整串交給 Claude
     """
     m = SIMPLE_PATTERN.match(text.strip())
 
     if m:
-        if m.group("note"):
+        if m.group("note") and m.group("amount"):
             note = m.group("note").strip()
             amount = float(m.group("amount"))
-        else:
+        elif m.group("note2") and m.group("amount2"):
             note = m.group("note2").strip()
             amount = float(m.group("amount2"))
+        else:
+            note = ""
+            amount = 0.0
 
-        category = _regex_classify(note)
+        if note and amount > 0:
+            category = _regex_classify(note)
+            if category:
+                logger.info(f"Regex classified: {note} → {category} NT${amount}")
+                return {"amount": amount, "category": category, "note": text.strip()}
 
-        if category:
-            logger.info(f"Regex classified: {note} → {category} NT${amount}")
+            logger.info(f"Regex got amount, asking Claude for category: {note}")
+            category = await claude_classify(note, amount)
             return {"amount": amount, "category": category, "note": text.strip()}
-
-        logger.info(f"Regex got amount, asking Claude for category: {note}")
-        category = await claude_classify(note, amount)
-        return {"amount": amount, "category": category, "note": text.strip()}
 
     logger.info(f"Regex failed, full Claude parse: {text}")
     return await claude_parse(text)
